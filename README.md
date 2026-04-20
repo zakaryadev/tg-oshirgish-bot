@@ -1,0 +1,1 @@
+# tg-oshirgish-bot
