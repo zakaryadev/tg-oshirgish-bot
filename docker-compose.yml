@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    container_name: signal_admin_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./subscribers.db:/app/subscribers.db
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
