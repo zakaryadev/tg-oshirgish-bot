@@ -16,6 +16,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    User,
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -86,11 +87,27 @@ async def init_db():
         if "custom_timer_seconds" not in cols: await db.execute("ALTER TABLE users ADD COLUMN custom_timer_seconds INTEGER")
         if "payment_status" not in cols: await db.execute("ALTER TABLE users ADD COLUMN payment_status TEXT DEFAULT 'none'")
         if "receipt_file_id" not in cols: await db.execute("ALTER TABLE users ADD COLUMN receipt_file_id TEXT")
+        if "name" not in cols: await db.execute("ALTER TABLE users ADD COLUMN name TEXT")
+        if "username" not in cols: await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
         await db.commit()
 
 async def log_action(user_id: int, action: str, details: str = None):
     async with aiosqlite.connect("subscribers.db") as db:
         await db.execute("INSERT INTO logs (user_id, action, details) VALUES (?, ?, ?)", (user_id, action, details))
+        await db.commit()
+
+async def save_user_info(user: User):
+    name = user.first_name
+    if user.last_name:
+        name += f" {user.last_name}"
+    username = user.username
+    async with aiosqlite.connect("subscribers.db") as db:
+        await db.execute("""
+            INSERT INTO users (user_id, name, username) 
+            VALUES (?, ?, ?) 
+            ON CONFLICT(user_id) DO UPDATE SET 
+            name=excluded.name, username=excluded.username
+        """, (user.id, name, username))
         await db.commit()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
@@ -147,6 +164,7 @@ def build_timer_keyboard(user_id: int) -> InlineKeyboardMarkup:
 # --- ОБРАБОТЧИКИ ---
 @dp.message(Command("start"))
 async def start_command(message: Message):
+    await save_user_info(message.from_user)
     if message.from_user.id in ADMIN_IDS:
         await message.answer("👋 Админ-панель активна.", reply_markup=build_admin_main_menu())
     else:
@@ -190,7 +208,7 @@ async def _show_users_list(message, page: int = 0):
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT COUNT(*) FROM users WHERE payment_status = 'approved'")
         total = (await cursor.fetchone())[0]
-        cursor = await db.execute("SELECT user_id, kick_date FROM users WHERE payment_status = 'approved' ORDER BY joined_at DESC LIMIT ? OFFSET ?", (limit, offset))
+        cursor = await db.execute("SELECT user_id, name, username, kick_date FROM users WHERE payment_status = 'approved' ORDER BY joined_at DESC LIMIT ? OFFSET ?", (limit, offset))
         rows = await cursor.fetchall()
     
     if not rows:
@@ -198,7 +216,12 @@ async def _show_users_list(message, page: int = 0):
         kb = None
     else:
         text = f"👥 <b>Пользователи</b> ({page+1}/{max(1, (total+limit-1)//limit)})\nВсего: {total}"
-        buttons = [[InlineKeyboardButton(text=f"👤 {r['user_id']} (до {str(r['kick_date']).split('.')[0]})", callback_data=f"manage_user:{r['user_id']}")] for r in rows]
+        buttons = []
+        for r in rows:
+            name_part = r['name'] if r['name'] else str(r['user_id'])
+            if r['username']:
+                name_part += f" (@{r['username']})"
+            buttons.append([InlineKeyboardButton(text=f"👤 {name_part} (до {str(r['kick_date']).split('.')[0]})", callback_data=f"manage_user:{r['user_id']}")])
         nav = []
         if page > 0: nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"users_page:{page-1}"))
         if offset + limit < total: nav.append(InlineKeyboardButton(text="➡️", callback_data=f"users_page:{page+1}"))
@@ -226,7 +249,12 @@ async def manage_user_cb(callback: CallbackQuery):
         logs = await cursor.fetchall()
     if not user: return
     log_txt = "\n".join([f"• <i>{l['timestamp']}</i>: {l['action']}" for l in logs])
-    text = f"👤 <b>ID:</b> <code>{user_id}</code>\n📅 <b>Зашел:</b> {str(user['joined_at']).split('.')[0]}\n⏰ <b>До:</b> {str(user['kick_date']).split('.')[0]}\n\n📜 <b>Логи:</b>\n{log_txt}"
+    
+    name_display = user['name'] if user['name'] else str(user_id)
+    if user['username']:
+        name_display += f" (@{user['username']})"
+        
+    text = f"👤 <b>Пользователь:</b> {name_display}\n🆔 <b>ID:</b> <code>{user_id}</code>\n📅 <b>Зашел:</b> {str(user['joined_at']).split('.')[0]}\n⏰ <b>До:</b> {str(user['kick_date']).split('.')[0]}\n\n📜 <b>Логи:</b>\n{log_txt}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏱ Таймер", callback_data=f"timer_menu:{user_id}"),
          InlineKeyboardButton(text="🚫 Кик", callback_data=f"kick_confirm:{user_id}")],
@@ -326,6 +354,7 @@ async def reject_cb(callback: CallbackQuery):
 @dp.message(F.photo | F.document)
 async def receipt_handler(message: Message):
     if message.from_user.id in ADMIN_IDS: return
+    await save_user_info(message.from_user)
     fid = message.photo[-1].file_id if message.photo else message.document.file_id
     async with aiosqlite.connect("subscribers.db") as db:
         await db.execute("INSERT INTO users (user_id, payment_status, receipt_file_id) VALUES (?, 'pending', ?) ON CONFLICT(user_id) DO UPDATE SET payment_status='pending', receipt_file_id=excluded.receipt_file_id", (message.from_user.id, fid))
@@ -341,6 +370,7 @@ async def receipt_handler(message: Message):
 async def on_join(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID: return
     uid = event.new_chat_member.user.id
+    await save_user_info(event.new_chat_member.user)
     link = event.invite_link.invite_link if event.invite_link else None
     if link: await force_revoke_link(link)
     td = await get_user_timer_delta(uid)
