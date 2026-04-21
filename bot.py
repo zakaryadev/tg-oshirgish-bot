@@ -50,6 +50,7 @@ current_default_timer = timedelta(days=30)
 # --- FSM ---
 class AdminStates(StatesGroup):
     waiting_custom_timer = State()
+    waiting_search_query = State()
 
 # --- БАЗА ДАННЫХ ---
 async def init_db():
@@ -226,6 +227,7 @@ async def _show_users_list(message, page: int = 0):
         if page > 0: nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"users_page:{page-1}"))
         if offset + limit < total: nav.append(InlineKeyboardButton(text="➡️", callback_data=f"users_page:{page+1}"))
         if nav: buttons.append(nav)
+        buttons.append([InlineKeyboardButton(text="🔍 Поиск", callback_data="search_users")])
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     if isinstance(message, CallbackQuery): await message.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -236,6 +238,45 @@ async def users_page_cb(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
     await _show_users_list(callback, int(callback.data.split(":")[1]))
     await callback.answer()
+
+@dp.callback_query(F.data == "search_users")
+async def search_users_cb(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return
+    await state.set_state(AdminStates.waiting_search_query)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="users_page:0")]])
+    await callback.message.edit_text("🔍 <b>Введите ID, имя или username для поиска:</b>", reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_search_query)
+async def process_search_query(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    query = message.text.strip()
+    await state.clear()
+    
+    async with aiosqlite.connect("subscribers.db") as db:
+        db.row_factory = aiosqlite.Row
+        search_term = f"%{query}%"
+        if query.isdigit():
+            cursor = await db.execute("SELECT * FROM users WHERE payment_status = 'approved' AND (user_id = ? OR name LIKE ? OR username LIKE ?) LIMIT 10", (int(query), search_term, search_term))
+        else:
+            cursor = await db.execute("SELECT * FROM users WHERE payment_status = 'approved' AND (name LIKE ? OR username LIKE ?) LIMIT 10", (search_term, search_term))
+        rows = await cursor.fetchall()
+
+    if not rows:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад к списку", callback_data="users_page:0")]])
+        await message.answer(f"По запросу «{query}» ничего не найдено.", reply_markup=kb)
+        return
+
+    text = f"🔍 <b>Результаты поиска по «{query}»</b>:\nНайдено: {len(rows)} (макс. 10)"
+    buttons = []
+    for r in rows:
+        name_part = r['name'] if r['name'] else str(r['user_id'])
+        if r['username']:
+            name_part += f" (@{r['username']})"
+        buttons.append([InlineKeyboardButton(text=f"👤 {name_part}", callback_data=f"manage_user:{r['user_id']}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data="users_page:0")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("manage_user:"))
 async def manage_user_cb(callback: CallbackQuery):
