@@ -94,7 +94,8 @@ async def init_db():
 
 async def log_action(user_id: int, action: str, details: str = None):
     async with aiosqlite.connect("subscribers.db") as db:
-        await db.execute("INSERT INTO logs (user_id, action, details) VALUES (?, ?, ?)", (user_id, action, details))
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute("INSERT INTO logs (user_id, action, details, timestamp) VALUES (?, ?, ?, ?)", (user_id, action, details, ts))
         await db.commit()
 
 async def save_user_info(user: User):

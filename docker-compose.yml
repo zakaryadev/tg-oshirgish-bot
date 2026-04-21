@@ -5,6 +5,8 @@ services:
     restart: always
     env_file:
       - .env
+    environment:
+      - TZ=Asia/Tashkent
     volumes:
       - ./subscribers.db:/app/subscribers.db
     logging:
