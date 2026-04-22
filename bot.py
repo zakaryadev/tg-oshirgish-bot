@@ -153,11 +153,19 @@ def build_admin_receipt_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 TIMER_PRESETS = [("1 день", "1d"), ("3 дня", "3d"), ("7 дней", "7d"), ("15 дней", "15d"), ("30 дней", "30d"), ("✏️ Своё", "custom")]
 
-def build_timer_keyboard(user_id: int) -> InlineKeyboardMarkup:
+def build_timer_keyboard(user_id: int, mode: str = "set") -> InlineKeyboardMarkup:
     rows = []
+    # Переключатель режима
+    rows.append([
+        InlineKeyboardButton(text="📍 Сброс (=)" if mode == "set" else "Сброс (=)", callback_data=f"timer_mode:{user_id}:set"),
+        InlineKeyboardButton(text="➕ Продлить (+)" if mode == "add" else "Продлить (+)", callback_data=f"timer_mode:{user_id}:add")
+    ])
+    
     row = []
     for label, code in TIMER_PRESETS:
-        row.append(InlineKeyboardButton(text=label, callback_data=f"set_timer:{user_id}:{code}"))
+        prefix = "=" if mode == "set" else "+"
+        display_label = f"{prefix} {label}" if code != "custom" else label
+        row.append(InlineKeyboardButton(text=display_label, callback_data=f"set_timer:{user_id}:{mode}:{code}"))
         if len(row) == 2: rows.append(row); row = []
     if row: rows.append(row)
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"timer_back:{user_id}")])
@@ -329,7 +337,16 @@ async def kick_exec_cb(callback: CallbackQuery):
 async def timer_menu_cb(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
     uid = int(callback.data.split(":")[1])
-    await callback.message.edit_reply_markup(reply_markup=build_timer_keyboard(uid)); await callback.answer()
+    await callback.message.edit_text(f"⏱ <b>Управление временем для {uid}</b>\nВыберите режим (Сброс или Продление) и период:", reply_markup=build_timer_keyboard(uid, "set"), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("timer_mode:"))
+async def timer_mode_cb(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS: return
+    parts = callback.data.split(":")
+    uid, mode = int(parts[1]), parts[2]
+    await callback.message.edit_reply_markup(reply_markup=build_timer_keyboard(uid, mode))
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("timer_back:"))
 async def timer_back_cb(callback: CallbackQuery):
@@ -340,27 +357,70 @@ async def timer_back_cb(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("set_timer:"))
 async def set_timer_cb(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
-    uid, code = int(callback.data.split(":")[1]), callback.data.split(":")[2]
+    parts = callback.data.split(":")
+    uid, mode, code = int(parts[1]), parts[2], parts[3]
+    
     if code == "custom":
-        await state.set_state(AdminStates.waiting_custom_timer); await state.update_data(uid=uid)
+        await state.set_state(AdminStates.waiting_custom_timer); await state.update_data(uid=uid, mode=mode)
         await callback.message.answer(f"Введите время для {uid} (напр. 15d):"); await callback.answer(); return
+        
     dt = parse_time_string([code])
-    await _save_timer(uid, dt)
-    await callback.answer(f"Установлено: {format_delta(dt)}", show_alert=True)
+    new_kd = await _save_timer(uid, dt, mode)
+    
+    mode_text = "Сброшено до" if mode == "set" else "Продлено на"
+    await callback.answer(f"{mode_text}: {format_delta(dt)}", show_alert=True)
+    await manage_user_cb(callback) # Refresh user details
 
-async def _save_timer(uid: int, td: timedelta):
+async def _save_timer(uid: int, td: timedelta, mode: str = "set"):
     async with aiosqlite.connect("subscribers.db") as db:
-        await db.execute("INSERT INTO users (user_id, custom_timer_seconds) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET custom_timer_seconds=excluded.custom_timer_seconds", (uid, int(td.total_seconds())))
+        db.row_factory = aiosqlite.Row
+        # Получаем текущий kick_date
+        cursor = await db.execute("SELECT kick_date FROM users WHERE user_id = ?", (uid,))
+        row = await cursor.fetchone()
+        
+        current_kd = None
+        if row and row['kick_date']:
+            try:
+                current_kd = datetime.strptime(str(row['kick_date']).split(".")[0], "%Y-%m-%d %H:%M:%S")
+            except:
+                pass
+        
+        now = datetime.now()
+        if mode == "add" and current_kd and current_kd > now:
+            new_kd = current_kd + td
+        else:
+            new_kd = now + td
+            
+        await db.execute("""
+            UPDATE users 
+            SET custom_timer_seconds = ?, kick_date = ?, payment_status = 'approved'
+            WHERE user_id = ?
+        """, (int(td.total_seconds()), new_kd, uid))
         await db.commit()
+        
+        # Уведомление пользователя
+        try:
+            msg = f"🔔 Ваша подписка обновлена администратором.\n"
+            if mode == "add":
+                msg += f"Добавлено: {format_delta(td)}\n"
+            else:
+                msg += f"Установлено: {format_delta(td)} с текущего момента\n"
+            msg += f"Новый срок: {str(new_kd).split('.')[0]}"
+            await bot.send_message(uid, msg)
+        except:
+            pass
+            
+        return new_kd
 
 @dp.message(AdminStates.waiting_custom_timer)
 async def custom_timer_msg(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
-    data = await state.get_data(); uid = data['uid']
+    data = await state.get_data(); uid = data['uid']; mode = data.get('mode', 'set')
     dt = parse_time_string(message.text.split())
     if dt.total_seconds() < 60: await message.answer("Мин. 1 мин."); return
-    await _save_timer(uid, dt); await state.clear()
-    await message.answer(f"✅ Для {uid} установлено: {format_delta(dt)}")
+    new_kd = await _save_timer(uid, dt, mode); await state.clear()
+    mode_text = "установлено" if mode == "set" else "добавлено"
+    await message.answer(f"✅ Для {uid} {mode_text}: {format_delta(dt)}\nНовый срок: {str(new_kd).split('.')[0]}")
 
 # --- ОДОБРЕНИЕ / ЧЕКИ ---
 @dp.callback_query(F.data.startswith("approve:"))
